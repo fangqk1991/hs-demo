@@ -1,0 +1,1123 @@
+#!groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
+////////////////////// 公共代码 START //////////////////////
+////////////////////// version: V1.2022-10-14: + Telegram Bot //////////////////////
+////////////////////// version: V1.2023-03-02: + Feishu Bot //////////////////////
+
+class MessagePusher {
+  public static def jenkins
+  public static String wechatBotKey
+  public static String feishuBotKey
+
+  public static String telegramBotToken
+  public static String chatId
+
+  public static def notify(String message) {
+    this.notifyToTelegram(message)
+    this.notifyToFeishu(message)
+    this.notifyToWecom(message)
+  }
+
+  public static def notifyToFeishu(String message) {
+    if (!this.feishuBotKey) {
+      return
+    }
+    def data = JsonOutput.toJson([
+      msg_type: 'text',
+      content: [
+        text:  message,
+      ],
+    ])
+    jenkins.sh """
+      curl https://open.feishu.cn/open-apis/bot/v2/hook/${this.feishuBotKey} \
+      --silent --output /dev/null --request POST --header 'Content-Type: application/json' \
+      --data '${data}'
+    """
+  }
+
+  public static def notifyToWecom(String message) {
+    if (!this.wechatBotKey) {
+      return
+    }
+    def data = JsonOutput.toJson([
+      msgtype: 'text',
+      text: [
+        content:  message,
+      ],
+    ])
+    jenkins.sh """
+      curl https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${this.wechatBotKey} \
+      --silent --output /dev/null --request POST --header 'Content-Type: application/json' \
+      --data '${data}'
+    """
+  }
+
+  public static def notifyToTelegram(String message) {
+    if (!this.telegramBotToken || !this.chatId) {
+      return
+    }
+    def data = JsonOutput.toJson([
+      text: message,
+    ])
+    jenkins.sh """
+      curl https://api.telegram.org/bot${this.telegramBotToken}/sendMessage?chat_id=${this.chatId} \
+      --silent --output /dev/null --request POST --header 'Content-Type: application/json' \
+      --data '${data}'
+    """
+  }
+}
+MessagePusher.jenkins = this
+
+class RemoteHost {
+  static def jenkins
+
+  public String internalIPAddress
+  public String name
+  public String host
+  public Integer port
+  public String user
+
+  def _execCommand(String command, Boolean ignoreError = false) {
+    def remoteInfo = [:]
+    remoteInfo.host = this.host
+    remoteInfo.port = this.port
+    remoteInfo.user = this.user
+    remoteInfo.name = this.name
+    remoteInfo.identityFile = jenkins.DEPLOY_ACCESS_KEY
+    remoteInfo.allowAnyHosts = true
+    // sshCommand: https://www.jenkins.io/doc/pipeline/steps/ssh-steps/
+    // sshCommand: https://github.com/jenkinsci/ssh-steps-plugin
+    def result = jenkins.sshCommand remote: remoteInfo, command: command, failOnError: !ignoreError
+    return result
+  }
+
+  def execCommand(String command, Boolean ignoreError = false) {
+    return this._execCommand(command, ignoreError)
+  }
+
+  def execCommandByForce(String command) {
+    return this.execCommand(command, true)
+  }
+
+  def execCurl(String method, String url, Object bodyData = null) {
+    def command = "curl --silent --fail --show-error --connect-timeout 3 -X ${method} \"${url}\""
+    if (bodyData) {
+      command = "${command} -H \"Content-type: application/json\" --data '${JsonOutput.toJson(bodyData)}'"
+    }
+    return this._execCommand(command)
+  }
+
+  def execCurl(CurlParams params) {
+    return this._execCommand(params.build())
+  }
+
+  def publishLatestToBackupService(DockerApp dockerApp, RuntimeParams params) {
+    this.fetchLatestImage(dockerApp)
+
+    this.dropBackupService(dockerApp)
+
+    // 删除当前 dockerApp.imageNameBak() 镜像，并将 dockerApp.latestImageTag 镜像备份到 dockerApp.imageNameBak()
+    this.execCommandByForce("docker image rm ${dockerApp.imageNameBak()}")
+    this.execCommand("docker tag ${dockerApp.latestImageTag} ${dockerApp.imageNameBak()}")
+
+    def tagsParams = [
+      Tags: ['Backup']
+    ]
+    def envConfigData = JsonOutput.toJson(tagsParams + params.envConfigData)
+    def envConfigDataExtras = JsonOutput.toJson(tagsParams + params.envConfigDataExtras + dockerApp.getConfigDataExtras())
+    def hostnameSuffix = params.hostnameSuffix ? "-${params.hostnameSuffix}" : ''
+
+    def portMapperList = dockerApp.makePortMapperList()
+    // 启动 Backup 服务
+    this.execCommandByForce("docker run -d --restart=unless-stopped \
+        --hostname=\"${dockerApp.realName()}-`hostname`${hostnameSuffix}\" \
+        --name=${dockerApp.containerNameBak()} \
+        --memory=\"${params.memoryLimit}\" \
+        -v '${dockerApp.logsDir()}:${dockerApp.logsDir()}' \
+        -e 'ENV=${params.configEnv}' \
+        -e 'configSecret=${params.configSecret}' \
+        -e 'NODE_CONFIG_EXTRA_JS=${params.extraConfigPath}' \
+        -e 'ENV_CONFIG_DATA=${envConfigData}' \
+        -e 'ENV_CONFIG_DATA_EXTRAS=${envConfigDataExtras}' \
+        ${dockerApp.bindVolumesStr()} \
+        ${portMapperList.collect({ "-p ${it.hostPortBak}:${it.containerPort}" }).join(' ')} \
+        ${dockerApp.imageNameBak()} \
+    ")
+  }
+
+  def duplicateBackupService(DockerApp dockerApp, RuntimeParams params) {
+    this.dropBackupService(dockerApp)
+
+    // 删除当前 dockerApp.imageNameBak() 镜像，并将 dockerApp.imageName() 镜像备份到 dockerApp.imageNameBak()
+    this.execCommandByForce("docker image rm ${dockerApp.imageNameBak()}")
+
+    try {
+      this.execCommand("docker tag ${dockerApp.imageName()} ${dockerApp.imageNameBak()}")
+    } catch (Exception e) {
+      def commitSHA = this.getLastContainerCommitSHA(dockerApp)
+      this.notify("⚠️ [${dockerApp.appName}] 上次发布的 ${commitSHA} 主镜像不存在")
+      def lastImageTag = "${dockerApp.dockerImageRepo}:${commitSHA}"
+      this.execCommand("docker pull ${lastImageTag}")
+      this.execCommand("docker tag ${lastImageTag} ${dockerApp.imageName()}")
+      this.execCommand("docker tag ${dockerApp.imageName()} ${dockerApp.imageNameBak()}")
+      this.notify("✔️ [${dockerApp.appName}] ${commitSHA} 已重新获取并产生备用镜像")
+    }
+
+    def tagsParams = [
+      Tags: ['Backup']
+    ]
+    def envConfigData = JsonOutput.toJson(tagsParams + params.envConfigData)
+    def envConfigDataExtras = JsonOutput.toJson(tagsParams + params.envConfigDataExtras + dockerApp.getConfigDataExtras())
+    def hostnameSuffix = params.hostnameSuffix ? "-${params.hostnameSuffix}" : ''
+
+    def portMapperList = dockerApp.makePortMapperList()
+    // 启动 Backup 服务
+    this.execCommandByForce("docker run -d --restart=unless-stopped \
+        --hostname=\"${dockerApp.realName()}-`hostname`${hostnameSuffix}\" \
+        --name=${dockerApp.containerNameBak()} \
+        --memory=\"${params.memoryLimit}\" \
+        -v '${dockerApp.logsDir()}:${dockerApp.logsDir()}' \
+        -e 'ENV=${params.configEnv}' \
+        -e 'configSecret=${params.configSecret}' \
+        -e 'NODE_CONFIG_EXTRA_JS=${params.extraConfigPath}' \
+        -e 'ENV_CONFIG_DATA=${envConfigData}' \
+        -e 'ENV_CONFIG_DATA_EXTRAS=${envConfigDataExtras}' \
+        ${dockerApp.bindVolumesStr()} \
+        ${portMapperList.collect({ "-p ${it.hostPortBak}:${it.containerPort}" }).join(' ')} \
+        ${dockerApp.imageNameBak()} \
+    ")
+  }
+
+  def checkMainDockerContainerExists(DockerApp dockerApp) {
+    def retCode = this.execCommand("docker container inspect ${dockerApp.containerName()} > /dev/null; echo \$?")
+    return retCode == '0'
+  }
+
+  def getLastContainerCommitSHA(DockerApp dockerApp) {
+    def responseText = this.execCommand("docker container inspect ${dockerApp.containerName()}")
+    def responseObj = new JsonSlurper().parseText(responseText)
+    def commitSHA = responseObj[0]['Config']['Labels']['commitSHA']
+    return commitSHA
+  }
+
+  def fetchLatestImage(DockerApp dockerApp) {
+    assert dockerApp.latestImageTag != null
+    this.execCommand("${jenkins.HUB_LOGIN}")
+    this.execCommand("docker pull ${dockerApp.latestImageTag}")
+  }
+
+  def prepareMainDockerImage(DockerApp dockerApp) {
+    this.fetchLatestImage(dockerApp)
+    // 删除当前 dockerApp.imageName() 镜像，并将 dockerApp.latestImageTag 镜像备份到 dockerApp.imageName()
+    this.execCommandByForce("docker image rm ${dockerApp.imageName()}")
+    this.execCommand("docker tag ${dockerApp.latestImageTag} ${dockerApp.imageName()}")
+  }
+
+  def reloadMainService(DockerApp dockerApp, RuntimeParams params) {
+    if (params.commandsHolder) {
+      this.execCommandsInDockerByForce(dockerApp.containerName(), params.commandsHolder.onMainServiceWillStop)
+    }
+    this.execCommandByForce("docker container stop ${dockerApp.containerName()}")
+    this.execCommandByForce("docker container rm ${dockerApp.containerName()}")
+    def tagsParams = [
+      Tags: ['Main']
+    ]
+    def envConfigData = JsonOutput.toJson(tagsParams + params.envConfigData)
+    def envConfigDataExtras = JsonOutput.toJson(tagsParams + params.envConfigDataExtras + dockerApp.getConfigDataExtras())
+    def hostnameSuffix = params.hostnameSuffix ? "-${params.hostnameSuffix}" : ''
+
+    def portMapperList = dockerApp.makePortMapperList()
+    // --restart=unless-stopped: 自动重启，除非收到暂停过
+    // --hostname=`hostname` 使用宿主 hostname
+    // -v 将 logs 目录 mount 到宿主，上报日志
+    this.execCommand("docker run -d --restart=unless-stopped \
+        --hostname=\"${dockerApp.realName()}-`hostname`${hostnameSuffix}\" \
+        --name=${dockerApp.containerName()} \
+        --memory=\"${params.memoryLimit}\" \
+        -v '${dockerApp.logsDir()}:${dockerApp.logsDir()}' \
+        -e 'ENV=${params.configEnv}' \
+        -e 'configSecret=${params.configSecret}' \
+        -e 'NODE_CONFIG_EXTRA_JS=${params.extraConfigPath}' \
+        -e 'ENV_CONFIG_DATA=${envConfigData}' \
+        -e 'ENV_CONFIG_DATA_EXTRAS=${envConfigDataExtras}' \
+        ${dockerApp.bindVolumesStr()} \
+        ${portMapperList.collect({ "-p ${it.hostPort}:${it.containerPort}" }).join(' ')} \
+        ${dockerApp.imageName()} \
+    ")
+    if (params.commandsHolder) {
+      this.execCommandsInDocker(dockerApp.containerName(), params.commandsHolder.onMainServiceDidStart)
+    }
+  }
+
+  def restoreBackupServiceFromBackup(DockerApp dockerApp, RuntimeParams params) {
+    // 删除当前 dockerApp.imageName() 镜像，并将 dockerApp.imageNameBak() 镜像备份到 dockerApp.imageName()
+    this.execCommandByForce("docker image rm ${dockerApp.imageName()}")
+    this.execCommand("docker tag ${dockerApp.imageNameBak()} ${dockerApp.imageName()}")
+    // 重新启动主服务
+    this.reloadMainService(dockerApp, params)
+  }
+
+  def execCommandsInDockerByForce(String containerName, String[] commands) {
+    this.execCommandsInDocker(containerName, commands, true)
+  }
+
+  def execCommandsInDocker(String containerName, String[] commands, Boolean ignoreError = false) {
+    for (String cmd in commands) {
+      def safeCmd = cmd.replace('"', '\\"')
+      this.execCommand("docker exec -t ${containerName} sh -c \"${safeCmd}\"", ignoreError)
+    }
+  }
+
+  def dropBackupService(DockerApp dockerApp) {
+    // 终止当前运行的 dockerApp.containerNameBak() 容器
+    this.execCommandByForce("docker container stop ${dockerApp.containerNameBak()}")
+    this.execCommandByForce("docker container rm ${dockerApp.containerNameBak()}")
+  }
+
+  def notify(String message) {
+    MessagePusher.notify("[Jenkins - ${this.name}] ${message}")
+  }
+}
+
+RemoteHost.jenkins = this
+
+class CurlParams {
+  String url
+  String method = 'GET'
+  Object bodyData = null
+  Boolean ignoreError = false
+
+  def build() {
+    def command = "curl --silent --fail --show-error --connect-timeout 3 -X ${this.method} \"${this.url}\""
+    if (this.bodyData) {
+      command = "${command} -H \"Content-type: application/json\" --data '${JsonOutput.toJson(this.bodyData)}'"
+    }
+    if (this.ignoreError) {
+      command = "${command} || true"
+    }
+    return command
+  }
+}
+
+class DockerCommandsHolder {
+  public String[] onMainServiceWillStop = []
+  public String[] onMainServiceDidStart = []
+}
+
+class RuntimeParams {
+  public String configEnv
+  public String extraConfigPath = ''
+  public String hostnameSuffix = ''
+  public String configSecret = ''
+  public envConfigData = []
+  public envConfigDataExtras = []
+  public DockerCommandsHolder commandsHolder = null
+  public String memoryLimit = '1024m'
+}
+
+class RuntimeExtrasParams {
+  public String extraConfigPath = null
+  public Object envConfigDataExtras = null
+  public DockerCommandsHolder commandsHolder = null
+  public String memoryLimit = null
+}
+
+class PortMapper {
+  public Integer hostPort
+  public Integer hostPortBak
+  public Integer containerPort
+}
+
+class DockerApp {
+  public String appName
+  public String dockerfilePath
+  public String dockerImageRepo
+
+  public String latestImageTag
+  public String[] bindVolumes = []
+  public PortMapper[] portMapperList
+
+  // 用于重启应用的命令行
+  public String commandForReloading = 'pm2 reload all'
+
+  // 若 healthApiPath 被定义，Docker 容器启动时，会根据定义对容器进行健康检查
+  public String healthApiPath
+  // 若 retainHealthWord 被定义，则会要求 healthApiPath 的响应内容与 retainHealthWord 匹配
+  public String retainHealthWord
+
+  // 一般情况下仅用于 staging 主服务
+  public CustomDockerParams customDockerParams
+
+  public PortMapper[] makePortMapperList() {
+    if (this.customDockerParams && this.customDockerParams.portMapperList) {
+      return this.customDockerParams.portMapperList
+    }
+    assert this.portMapperList != null
+    return this.portMapperList
+  }
+
+  public Integer[] ports() {
+    def portMapperList = this.makePortMapperList()
+    return (Integer[]) (portMapperList.collect({ it.hostPort }))
+  }
+
+  public Integer[] portsBak() {
+    def portMapperList = this.makePortMapperList()
+    return (Integer[]) (portMapperList.collect({ it.hostPortBak }))
+  }
+
+  def setCustomDockerParams(CustomDockerParams params) {
+    this.customDockerParams = params
+  }
+
+  def getConfigDataExtras() {
+    if (this.customDockerParams) {
+      return this.customDockerParams.configDataExtras
+    }
+    return []
+  }
+
+  def realName() {
+    if (this.customDockerParams) {
+      return "${this.appName}.${this.customDockerParams.suffix}"
+    }
+    return this.appName
+  }
+
+  def logsDir() {
+    return "/data/logs/${this.appName}"
+  }
+
+  def bindVolumesStr() {
+    return this.bindVolumes.collect({ "-v '${it}:${it}'" }).join(' ')
+  }
+
+  def containerName() {
+    return "container.${this.realName()}"
+  }
+
+  def containerNameBak() {
+    return "container.${this.realName()}.bak"
+  }
+
+  def imageName() {
+    return "${this.realName()}"
+  }
+
+  def imageNameBak() {
+    return "${this.realName()}.bak"
+  }
+}
+
+class KongService {
+  public String region;
+  public RemoteHost kongHost;
+  public String upstreamName;
+  public String healthApiPath;
+  public String[] targetHosts;
+  public String targetMainPort;
+  public String targetBackupPort;
+  public customWeightMap = []
+}
+
+class ConfigSource {
+  public String gitUrl
+  public String credentialsId
+  public String tagName
+  public String appName
+}
+
+class CustomDockerParams {
+  public String suffix
+  /**
+   * @deprecated
+   */
+  public Integer[] hostPorts
+  public configDataExtras = []
+
+  public PortMapper[] portMapperList
+}
+
+class JenkinsApp {
+  static def jenkins
+
+  // 配置文件密码
+  public String configSecret = ''
+
+  //  Staging 服务器
+  public RemoteHost stagingHost;
+
+  //  Preview 服务器
+  public RemoteHost previewHost;
+
+  //  Production 服务器列表，默认为空列表
+  public RemoteHost[] productionHosts = []
+
+  // 网关列表，只作用于生产环境；用于控制应用服务上下线，默认为空列表
+  public KongService[] kongServices = []
+
+  // 是否跳过上线前的健康检查，默认为 false
+  // 一般来说，只有在端口信息发生变更时才会跳过上线前健康检查
+  public Boolean skipHealthCheck = false
+
+  // 在服务启动后、网关上线前需要人工确认，默认为 false
+  public Boolean checkBeforeOnline = false
+
+  // 发布成功后删除备用服务
+  public Boolean dropBackupServiceAfterSuccess = false
+
+  // Docker 镜像若已存在，则直接跳过镜像准备
+  public Boolean lazyBuilding = true
+
+  // Docker 镜像信息定义，测试环境和生产环境采用同一份镜像
+  public DockerApp dockerApp
+
+  // Docker 运行时的个性化配置 (staging)
+  public RuntimeParams stagingRetainParams
+
+  // Docker 运行时的个性化配置 (preview)
+  public RuntimeParams previewRetainParams
+
+  // Docker 运行时的个性化配置 (production)，一般情况下，多个 production 机器采用相同的配置信息
+  public RuntimeParams productionRetainParams
+
+  // { remoteHost.name -> RuntimeExtrasParams } 字典，为生产环境目标机器提供个性化运行时配置
+  public Map<String, RuntimeExtrasParams> remoteHostRuntimeExtrasParamsMap = new HashMap<>()
+
+  // { remoteHost.name -> RuntimeParams } 字典，实际为生产环境提供的配置信息，内容为 productionRetainParams + envConfigData
+  private Map<String, RuntimeParams> _remoteHostRuntimeParamsMap = new HashMap<>()
+
+  // 快速模式下，仅作新镜像发布及重新启动，不会复制备用服务，不会去处理网关配置，发布期间可能会出现服务不可用的情况
+  public Boolean quickMode = false
+
+  // 配置文件信息
+  public ConfigSource configSource
+
+  // Git Commit SHA
+  private String commitSHA
+
+  // 启动应用到准备完毕的时间，用于启动应用到健康检查间的休眠参考，单位: 秒
+  public Integer warmingTime = 3
+
+  // 配置文件目录
+  public String configDir = './config/'
+
+  // 发布前审计员列表，列表内的用户才能执行发布确认操作；列表为空，表示所有用户均可执行发布确认操作
+  public String[] auditors = []
+
+  // 用于 staging 环境的自定义 Docker 容器
+  private Map<String, CustomDockerParams> stagingCustomDockerParamsMap = new HashMap<>()
+
+  // prepare 必须被调用
+  def prepare(String commitSHA, String gitBranch) {
+    this.setCommitSHA(commitSHA)
+    def params = this.extractStagingCustomDockerParams(gitBranch)
+    if (params) {
+      this.dockerApp.setCustomDockerParams(params)
+    }
+    def message = jenkins.sh(script: "git log -1", returnStdout: true)
+    this.notify("准备发布 ${this.dockerApp.realName()}\n\n${message}", true)
+  }
+
+  // prepare 必须被调用
+  def setCommitSHA(String commitSHA) {
+    assert this.dockerApp != null
+    this.commitSHA = commitSHA
+    this.dockerApp.latestImageTag = "${this.dockerApp.dockerImageRepo}:${commitSHA}"
+  }
+
+  def extractStagingCustomDockerParams(String gitBranch) {
+    Pattern pattern = Pattern.compile("custom/${this.dockerApp.appName}/(\\w+)");
+    Matcher matcher = pattern.matcher(gitBranch)
+    if (matcher.find()) {
+      String suffix = matcher.group(1)
+      assert this.stagingCustomDockerParamsMap.containsKey(suffix)
+      return this.stagingCustomDockerParamsMap[suffix]
+    }
+    return null
+  }
+
+  def notify(String message, withURL = false, String[] userEmailList = []) {
+    if (withURL) {
+      message = "${jenkins.BUILD_URL}console\n---\n${message}"
+    }
+    if (userEmailList.size() > 0) {
+      message = "${message}\n\n"
+    }
+    MessagePusher.notify("[Jenkins - ${this.dockerApp.realName()}] ${message}")
+  }
+
+  def sendEmail(String title, String content, String[] receiverList) {
+  }
+
+  def runtimeParamsForRemoteHost(RemoteHost remoteHost, RuntimeParams retainParams) {
+    def params = new RuntimeParams(
+      configSecret: this.configSecret,
+      configEnv: retainParams.configEnv,
+      extraConfigPath: retainParams.extraConfigPath,
+      envConfigData: retainParams.envConfigData,
+      envConfigDataExtras: retainParams.envConfigDataExtras,
+      commandsHolder: retainParams.commandsHolder,
+      memoryLimit: retainParams.memoryLimit,
+    )
+    if (this.remoteHostRuntimeExtrasParamsMap[remoteHost.name]) {
+      RuntimeExtrasParams runtimeExtrasParams = this.remoteHostRuntimeExtrasParamsMap[remoteHost.name]
+      if (runtimeExtrasParams.extraConfigPath) {
+        params.extraConfigPath = runtimeExtrasParams.extraConfigPath
+      }
+      if (runtimeExtrasParams.envConfigDataExtras) {
+        params.envConfigDataExtras = runtimeExtrasParams.envConfigDataExtras
+      }
+      if (runtimeExtrasParams.commandsHolder) {
+        params.commandsHolder = runtimeExtrasParams.commandsHolder
+      }
+      if (runtimeExtrasParams.memoryLimit) {
+        params.memoryLimit = runtimeExtrasParams.memoryLimit
+      }
+    }
+    return params
+  }
+
+  def publishForStaging() {
+    def dockerApp = this.dockerApp
+    def remoteHost = this.stagingHost
+    def params = this.runtimeParamsForRemoteHost(remoteHost, this.stagingRetainParams)
+    remoteHost.prepareMainDockerImage(dockerApp)
+    remoteHost.reloadMainService(dockerApp, params)
+  }
+
+  def publishForPreview() {
+    def dockerApp = this.dockerApp
+    def remoteHost = this.previewHost
+    def params = this.runtimeParamsForRemoteHost(remoteHost, this.previewRetainParams)
+    remoteHost.prepareMainDockerImage(dockerApp)
+    remoteHost.reloadMainService(dockerApp, params)
+  }
+
+  def publishForCustomRemoteHost(RemoteHost remoteHost, RuntimeParams params) {
+    params.configSecret = this.configSecret
+    def dockerApp = this.dockerApp
+    remoteHost.prepareMainDockerImage(dockerApp)
+    remoteHost.reloadMainService(dockerApp, params)
+  }
+
+  def makeProductionRuntimeParams() {
+    for (RemoteHost remoteHost in this.productionHosts) {
+      def params = this.runtimeParamsForRemoteHost(remoteHost, this.productionRetainParams)
+      this._remoteHostRuntimeParamsMap.put(remoteHost.name, params)
+    }
+  }
+
+  def fetchLatestImagesForProduction() {
+    def dockerApp = this.dockerApp
+    for (RemoteHost remoteHost in this.productionHosts) {
+      remoteHost.fetchLatestImage(dockerApp)
+    }
+  }
+
+  def assertDockerAppHealthy(RemoteHost remoteHost, DockerApp dockerApp, Integer[] ports) {
+    if (!this.skipHealthCheck && dockerApp.healthApiPath) {
+      jenkins.sleep(time: this.warmingTime, unit: 'SECONDS')
+      for (Integer port in ports) {
+        def response = remoteHost.execCurl(new CurlParams(
+          method: 'GET',
+          url: "http://127.0.0.1:${port}${dockerApp.healthApiPath}"
+        ))
+        if (dockerApp.retainHealthWord) {
+          assert response == dockerApp.retainHealthWord
+        }
+      }
+    }
+  }
+
+  def publishForBackup() {
+    this.fetchLatestImagesForProduction()
+
+    def dockerApp = this.dockerApp
+    this.notify('✔️ 服务即将发布到生产环境 - Backup')
+
+    this.makeProductionRuntimeParams()
+    for (RemoteHost remoteHost in this.productionHosts) {
+      def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+      remoteHost.publishLatestToBackupService(dockerApp, params)
+      this.assertDockerAppHealthy(remoteHost, dockerApp, dockerApp.portsBak())
+    }
+    this.notify('✔️ 备用服务已成功启动')
+  }
+
+  def publishForProduction() {
+    this.fetchLatestImagesForProduction()
+    this.waitingForAudit('请确认是否发布到生产环境?')
+
+    def dockerApp = this.dockerApp
+    this.notify('✔️ 服务即将发布到生产环境')
+
+    this.makeProductionRuntimeParams()
+    if (this.quickMode) {
+      for (RemoteHost remoteHost in this.productionHosts) {
+        def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+        remoteHost.prepareMainDockerImage(dockerApp)
+        remoteHost.reloadMainService(dockerApp, params)
+        this.assertDockerAppHealthy(remoteHost, dockerApp, dockerApp.ports())
+      }
+      return
+    }
+
+    this.kong_checkTargetsStatus()
+    this.notify('✔️ 网关状态正常，即将发布')
+
+    for (RemoteHost remoteHost in this.productionHosts) {
+      // 针对新增机器：若主服务不存在，则先启动主服务，以便备用服务复制
+      if (!remoteHost.checkMainDockerContainerExists(dockerApp)) {
+        this.notify("✔️ ${remoteHost.name} 中不存在主服务，即将创建并启动...")
+        def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+        remoteHost.prepareMainDockerImage(dockerApp)
+        remoteHost.reloadMainService(dockerApp, params)
+        this.assertDockerAppHealthy(remoteHost, dockerApp, dockerApp.ports())
+      }
+    }
+
+    for (RemoteHost remoteHost in this.productionHosts) {
+      def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+      remoteHost.duplicateBackupService(dockerApp, params)
+      this.assertDockerAppHealthy(remoteHost, dockerApp, dockerApp.portsBak())
+    }
+    this.notify('✔️ 备用服务复制并启动')
+    jenkins.sleep(time: this.warmingTime, unit: 'SECONDS')
+    if (this.kongServices.size() > 0) {
+      this.kong_publishBackupTargets()
+      this.notify('✔️ 备用服务已上线')
+      this.kong_dismissMainTargets()
+      this.notify('✔️ 主服务已下线')
+    }
+
+    try {
+      for (RemoteHost remoteHost in this.productionHosts) {
+        def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+        remoteHost.prepareMainDockerImage(dockerApp)
+        remoteHost.reloadMainService(dockerApp, params)
+        this.assertDockerAppHealthy(remoteHost, dockerApp, dockerApp.ports())
+      }
+    } catch (Exception e) {
+      this.notify('⚠️️ 主服务部署失败，即将回滚')
+      for (RemoteHost remoteHost in this.productionHosts) {
+        def params = this._remoteHostRuntimeParamsMap[remoteHost.name] as RuntimeParams
+        remoteHost.restoreBackupServiceFromBackup(dockerApp, params)
+        if (!this.skipHealthCheck && dockerApp.healthApiPath) {
+          jenkins.sleep(time: this.warmingTime, unit: 'SECONDS')
+          for (Integer port in dockerApp.ports()) {
+            remoteHost.execCurl(new CurlParams(
+              method: 'GET',
+              url: "http://127.0.0.1:${port}${dockerApp.healthApiPath}"
+            ))
+          }
+        }
+      }
+      this.kong_publishMainTargets()
+      this.notify('⚠️️ 旧版主服务已重新上线')
+      this.kong_dismissBackupTargets()
+      this.notify('⚠️️️ 备用服务已下线')
+      this.notify('✔️ 回滚完成')
+      throw e
+    }
+
+    this.notify("✔️ 新的镜像已部署，主服务已重新启动。Git Commit: ${this.commitSHA}")
+
+    if (this.kongServices.size() > 0) {
+      jenkins.sleep(time: this.warmingTime, unit: 'SECONDS')
+      if (this.checkBeforeOnline) {
+        this.waitingForAudit('上线后流量将指向主服务，确认上线吗?')
+      }
+      this.kong_publishMainTargets()
+      this.notify('✔️ 主服务已上线')
+      this.kong_dismissBackupTargets()
+      this.notify('✔️ 备用服务已下线')
+    }
+
+    if (this.dropBackupServiceAfterSuccess) {
+      jenkins.sleep(time: 5, unit: 'SECONDS')
+      for (RemoteHost remoteHost in this.productionHosts) {
+        remoteHost.dropBackupService(dockerApp)
+      }
+      this.notify('✔️ 备用服务已停止运行')
+    }
+  }
+
+  /**
+   * @description 确保当前网关 Target 指向为主服务，或 Target 列表为空
+   */
+  def kong_checkTargetsStatus() {
+    for (KongService kongService in this.kongServices) {
+      def kongHost = kongService.kongHost
+      for (String targetHost in kongService.targetHosts) {
+        def responseText = kongHost.execCurl(new CurlParams(
+          method: 'GET',
+          url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets"
+        )) as String
+        def responseObj = new JsonSlurper().parseText(responseText)
+        def targetList = responseObj['data'] as List
+        def hasMainTarget = false
+        for (targetInfo in targetList) {
+          def target = targetInfo['target'] as String
+          if (target.endsWith(":${kongService.targetMainPort}")) {
+            hasMainTarget = true
+            break
+          }
+        }
+        assert targetList.size() == 0 || hasMainTarget
+      }
+    }
+  }
+
+  def kong_publishBackupTargets() {
+    try {
+      for (KongService kongService in this.kongServices) {
+        def kongHost = kongService.kongHost
+        for (String targetHost in kongService.targetHosts) {
+          def backupTarget = "${targetHost}:${kongService.targetBackupPort}"
+          if (!this.skipHealthCheck) {
+            kongHost.execCurl(new CurlParams(
+              method: 'GET',
+              url: "http://${backupTarget}${kongService.healthApiPath}"
+            ))
+          }
+          kongHost.execCurl(new CurlParams(
+            method: 'POST',
+            url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets",
+            bodyData: [
+              target: backupTarget,
+              weight: 1000,
+              tags  : ['Backup']
+            ]
+          ))
+        }
+      }
+    } catch (Exception e) {
+      this.notify('⚠️️ 备用服务上线失败，将清理已上线的备用服务')
+      this.kong_dismissBackupTargets()
+      this.notify('⚠️️️ 备用服务均已下线')
+      this.notify('✔️ 回滚完成')
+      throw e
+    }
+  }
+
+  def kong_dismissBackupTargets() {
+    for (KongService kongService in this.kongServices) {
+      def kongHost = kongService.kongHost
+      for (String targetHost in kongService.targetHosts) {
+        def backupTarget = "${targetHost}:${kongService.targetBackupPort}"
+        kongHost.execCurl(new CurlParams(
+          method: 'DELETE',
+          url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets/${backupTarget}",
+          ignoreError: true
+        ))
+      }
+    }
+  }
+
+  def kong_publishMainTargets() {
+    for (KongService kongService in this.kongServices) {
+      def kongHost = kongService.kongHost
+      for (String targetHost in kongService.targetHosts) {
+        def mainTarget = "${targetHost}:${kongService.targetMainPort}"
+        if (!this.skipHealthCheck) {
+          kongHost.execCurl(new CurlParams(
+            method: 'GET',
+            url: "http://${mainTarget}${kongService.healthApiPath}"
+          ))
+        }
+        def customWeightMap = kongService.customWeightMap
+        kongHost.execCurl(new CurlParams(
+          method: 'POST',
+          url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets",
+          bodyData: [
+            target: mainTarget,
+            weight: customWeightMap[targetHost] ? customWeightMap[targetHost] : 1000,
+            tags  : ['Main']
+          ]
+        ))
+      }
+    }
+  }
+
+  def kong_dismissMainTargets() {
+    for (KongService kongService in this.kongServices) {
+      def kongHost = kongService.kongHost
+      for (String targetHost in kongService.targetHosts) {
+        def mainTarget = "${targetHost}:${kongService.targetMainPort}"
+        kongHost.execCurl(new CurlParams(
+          method: 'DELETE',
+          url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets/${mainTarget}",
+          ignoreError: true
+        ))
+      }
+    }
+  }
+
+  def copyConfigFiles() {
+    if (!this.dockerApp) {
+      return
+    }
+    jenkins.sh "mkdir -p ./deploy/build/my-config"
+    jenkins.dir("./deploy/build/my-config") {
+      // git: https://www.jenkins.io/doc/pipeline/steps/git/
+      jenkins.checkout poll: false,
+        scm: [
+          $class           : 'GitSCM',
+          userRemoteConfigs: [
+            [
+              url: this.configSource.gitUrl, credentialsId: this.configSource.credentialsId]
+          ],
+          branches         : [[name: "refs/tags/${this.configSource.tagName}"]]
+        ]
+    }
+    jenkins.sh "cp ./deploy/build/my-config/apps/${this.configSource.appName}/* ${configDir}"
+    // 暂时忽略此步骤可能发生的错误
+    jenkins.sh "cp ./deploy/build/my-config/core/ali-oss-lazy-upload/*.js ./deploy/docker.deps/ || true"
+    jenkins.sh "cp ./deploy/build/my-config/core/ali-oss-download/*.js ./deploy/docker.deps/ || true"
+    jenkins.sh "rm -rf ./deploy/build/my-config"
+  }
+
+  public Boolean checkDockerImageExists() {
+    assert this.dockerApp != null
+    assert this.commitSHA != null
+
+    try {
+      jenkins.sh "docker pull ${this.dockerApp.dockerImageRepo}:${this.commitSHA}"
+      return true
+    } catch (Exception e) {
+    }
+    return false
+  }
+
+  def prepareDockerImage() {
+    assert this.dockerApp != null && this.dockerApp.latestImageTag != null
+    assert this.commitSHA != null
+
+    if (this.lazyBuilding) {
+      if (this.checkDockerImageExists()) {
+        this.notify("当前镜像已存在，跳过 Docker 镜像构建操作")
+        return
+      }
+    }
+    def dockerApp = this.dockerApp
+    def latestImageTag = this.dockerApp.latestImageTag
+    jenkins.sh """
+      docker build -t ${dockerApp.imageName()} -f ${dockerApp.dockerfilePath} . \
+        --network=host \
+        --build-arg commitSHA=${this.commitSHA} \
+        --build-arg configSecret=${this.configSecret}
+    """
+
+    jenkins.sh "docker tag ${dockerApp.imageName()} ${latestImageTag}"
+    jenkins.sh "docker push ${latestImageTag}"
+  }
+
+  def waitingForAudit(String hints) {
+    def auditorsStr = this.auditors.size() > 0 ? this.auditors.join(', ') : '任何人'
+    def message = "${hints}\n审批人: ${auditorsStr}"
+    this.notify(message, true, this.auditors)
+
+    if (this.auditors.size() > 0) {
+      this.sendEmail(
+        "[发版确认] ${this.dockerApp.realName()}",
+        "请前往 <a href=\"${jenkins.JOB_URL}\" target=\"_blank\">${jenkins.JOB_URL}</a> 查看发布状态并进行发版审批",
+        this.auditors
+      )
+    }
+    /**
+     * https://www.jenkins.io/doc/pipeline/steps/pipeline-input-step/#input-wait-for-interactive-input
+     * 文档中提到的 submitter 似乎没有起到作用，故弃用
+     */
+    def approved = false
+    while (!approved) {
+      def auditor = jenkins.input message: message, submitterParameter: 'submitter', ok: '确定'
+      if (this.auditors.size() == 0 || this.auditors.contains(auditor)) {
+        approved = true
+        this.notify("${auditor} 通过了发布审批")
+      } else {
+        jenkins.echo "${auditor} 无权审批，请通知 ${auditorsStr} 进行审批"
+      }
+    }
+  }
+
+  def reloadProductionApps() {
+    assert this.dockerApp.commandForReloading != null
+    this.waitingForAudit('请确认是否重启?')
+
+    this.notify("准备重启 ${this.dockerApp.appName}", true)
+    for (RemoteHost remoteHost in this.productionHosts) {
+      def internalIPAddress = remoteHost.internalIPAddress
+
+      for (KongService kongService in this.kongServices) {
+        assert kongService.targetHosts.length > 1
+        def kongHost = kongService.kongHost
+        for (String targetHost in kongService.targetHosts) {
+          def mainTarget = "${internalIPAddress}:${kongService.targetMainPort}"
+          if (internalIPAddress.equals(targetHost)) {
+            kongHost.execCurl(new CurlParams(
+              method: 'DELETE',
+              url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets/${mainTarget}",
+              ignoreError: true
+            ))
+          }
+        }
+      }
+      this.notify("✔️ ${this.dockerApp.appName}@${remoteHost.name} 已从网关下线")
+
+      remoteHost.execCommandsInDocker(this.dockerApp.containerName(), (String[]) ([this.dockerApp.commandForReloading]), true)
+      this.assertDockerAppHealthy(remoteHost, this.dockerApp, this.dockerApp.ports())
+      this.notify("✔️ ${this.dockerApp.appName}@${remoteHost.name} 服务已重启")
+
+      for (KongService kongService in this.kongServices) {
+        def kongHost = kongService.kongHost
+        for (String targetHost in kongService.targetHosts) {
+          def mainTarget = "${internalIPAddress}:${kongService.targetMainPort}"
+          if (internalIPAddress.equals(targetHost)) {
+            if (!this.skipHealthCheck) {
+              kongHost.execCurl(new CurlParams(
+                method: 'GET',
+                url: "http://${mainTarget}${kongService.healthApiPath}"
+              ))
+            }
+            def customWeightMap = kongService.customWeightMap
+            kongHost.execCurl(new CurlParams(
+              method: 'POST',
+              url: "http://127.0.0.1:8001/upstreams/${kongService.upstreamName}/targets",
+              bodyData: [
+                target: mainTarget,
+                weight: customWeightMap[targetHost] ? customWeightMap[targetHost] : 1000,
+                tags  : ['Main']
+              ]
+            ))
+          }
+        }
+      }
+      this.notify("✔️ ${this.dockerApp.appName}@${remoteHost.name} 已上线")
+    }
+  }
+}
+
+JenkinsApp.jenkins = this
+////////////////////// 公共代码 END //////////////////////
+
+def myApp = new JenkinsApp(
+  dropBackupServiceAfterSuccess: true,
+  // quickMode = true 时，仅作新镜像发布及重新启动，不会复制备用服务，不会去处理网关配置，发布期间可能会出现服务不可用的情况 (reload 服务的短暂时间)
+//  quickMode: true,
+  auditors: [],
+  dockerApp: new DockerApp(
+    appName: 'data',
+    dockerfilePath: './deploy/data/Dockerfile',
+    dockerImageRepo: 'hub.your_host.app/project/data',
+    portMapperList: [
+      new PortMapper(hostPort: 5300, hostPortBak: 15300, containerPort: 5300),
+      new PortMapper(hostPort: 5399, hostPortBak: 15399, containerPort: 5399),
+    ],
+    healthApiPath: '/api/health/ping',
+  ),
+  stagingRetainParams: new RuntimeParams(
+    configEnv: 'staging',
+  ),
+  previewRetainParams: new RuntimeParams(
+    configEnv: 'production',
+  ),
+  productionRetainParams: new RuntimeParams(
+    configEnv: 'production',
+  ),
+  stagingHost: new RemoteHost(name: 'sh-staging', host: 'xxx.xxx.xxx.xxx', internalIPAddress: 'yyy.yyy.yyy.yyy', port: 22, user: 'ubuntu'),
+  productionHosts: [
+    new RemoteHost(name: 'app-sh-xxx.xxx.xxx.xxx-yyy.yyy.yyy.yyy', host: 'xxx.xxx.xxx.xxx', internalIPAddress: 'yyy.yyy.yyy.yyy', port: 22, user: 'ubuntu'),
+  ],
+  kongServices: [
+    new KongService(
+      region: 'kong-sh',
+      kongHost: new RemoteHost(name: 'ap-sh-xxx', host: 'xxx.xxx.xxx.xxx', port: 22, user: 'ubuntu'),
+      upstreamName: 'upstream.prod.data-admin',
+      healthApiPath: '/api/health/ping',
+      targetHosts: [
+        '10.0.0.1',
+        '10.0.0.2',
+      ],
+      targetMainPort: 5399,
+      targetBackupPort: 15399,
+    ),
+  ]
+)
+
+pipeline {
+  agent any
+  // https://www.jenkins.io/doc/book/pipeline/syntax/#options
+  options {
+    disableConcurrentBuilds()
+  }
+  environment {
+    // GIT_COMMIT: https://plugins.jenkins.io/git/
+    COMMIT = GIT_COMMIT.substring(0, 8)
+    BRANCH_NAME = "${GIT_BRANCH}"
+    // credentials: https://www.jenkins.io/doc/book/using/using-credentials/
+    DEPLOY_ACCESS_KEY = credentials('SSHKeyStr_Jenkins')
+    HUB_USERNAME = credentials('Harbor_Username')
+    HUB_PASSWORD = credentials('Harbor_Password')
+    HUB_LOGIN = "docker login hub.your_host.app -u \"${HUB_USERNAME}\" -p \"${HUB_PASSWORD}\""
+  }
+  stages {
+    stage('发布应用初始化') {
+      steps {
+        script {
+          myApp.prepare("${COMMIT}", "${BRANCH_NAME}")
+          sh "${HUB_LOGIN}"
+        }
+      }
+    }
+    stage('准备 Docker 镜像') {
+      steps {
+        script {
+          myApp.prepareDockerImage()
+        }
+      }
+    }
+    stage('Deploy - Staging') {
+      when {
+        branch 'staging/data'
+      }
+      steps {
+        script {
+          myApp.publishForStaging()
+        }
+      }
+    }
+    stage('Deploy - Production') {
+      when {
+        branch 'release/data'
+      }
+      steps {
+        script {
+          myApp.publishForProduction()
+        }
+      }
+    }
+  }
+  post {
+    success {
+      script {
+        myApp.notify('🚀 发布成功', true)
+      }
+    }
+    failure {
+      script {
+        myApp.notify('❌ 发布失败', true)
+      }
+    }
+    aborted {
+      script {
+        myApp.notify('🚫 发布被终止', true)
+      }
+    }
+  }
+}

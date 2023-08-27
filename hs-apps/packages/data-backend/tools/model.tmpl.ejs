@@ -1,0 +1,71 @@
+import { FeedBase } from 'fc-feed'
+import { MyDatabase } from '<%-rootDir%>/services/MyDatabase'
+
+const _cols: string[] = [
+  // prettier-ignore
+<% sqlCols.forEach((item) => { -%>
+  '<%-item.columnName%>',
+<% }) -%>
+]
+const _insertableCols: string[] = [
+  // prettier-ignore
+<% sqlCols.filter((item) => item.insertable).forEach((item) => { -%>
+  '<%-item.columnName%>',
+<% }) -%>
+]
+const _modifiableCols: string[] = [
+  // prettier-ignore
+<% sqlCols.filter((item) => item.modifiable).forEach((item) => { -%>
+  '<%-item.columnName%>',
+<% }) -%>
+]
+
+const _timestampTypeCols: string[] = [
+  // prettier-ignore
+<% sqlCols.filter((item) => item.isTimestamp).forEach((item) => { -%>
+  '<%-item.columnName%>',
+<% }) -%>
+]
+
+export default class <%-className%> extends FeedBase {
+<% sqlCols.forEach((item) => { -%>
+  /**
+   * @description <%-item.propDescription%>
+   */
+  public <%-getPropName(item.columnName)%>!: <%-item.columnType%>
+<% }) -%>
+
+  public constructor() {
+    super()
+    this.setDBProtocolV2({
+      database: MyDatabase.<%-dbProp%>,
+      table: '<%-tableName%>',
+      primaryKey: <%-decoratePrimaryKey(primaryKey)%>,
+      cols: _cols,
+      insertableCols: _insertableCols,
+      modifiableCols: _modifiableCols,
+      timestampTypeCols: _timestampTypeCols,
+    })
+<% if (reloadOnAdded) { -%>
+    this._reloadOnAdded = true
+<% } -%>
+<% if (reloadOnUpdated) { -%>
+    this._reloadOnUpdated = true
+<% } -%>
+  }
+
+  public fc_defaultInit() {
+    // This function is invoked by constructor of FCModel
+<% sqlCols.filter((item) => item.hasDefValue).forEach((item) => { -%>
+    this.<%-getPropName(item.columnName)%> = <%-decoratePrimaryKey(item.defValue)%>
+<% }) -%>
+  }
+
+  public fc_propertyMapper() {
+    return {
+<% sqlCols.forEach((item) => { -%>
+      <%-getPropName(item.columnName)%>: '<%-item.columnName%>',
+<% }) -%>
+    }
+  }
+}

@@ -89,8 +89,8 @@ export const DataPageView: React.FC = () => {
                 ),
               })
               dialog.show(async (file) => {
-                const buffer = FrontendFileReader.loadFileBuffer(file)
-                await TypicalExcel.excelFromBuffer(buffer as any)
+                const buffer = await FrontendFileReader.loadFileBuffer(file)
+                await TypicalExcel.excelFromBuffer(buffer)
                   .then(async (excel) => {
                     const records = DataFieldHelper.transferNaturalRecords(tableInfo, excel.records())
                     const request = MyRequest(new CommonAPI(DataRecordApis.BatchRecordsPut, tableInfo.tableId))

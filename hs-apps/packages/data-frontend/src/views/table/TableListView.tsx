@@ -42,8 +42,8 @@ export const TableListView: React.FC = () => {
               description: '程序会将 Excel 首行描述解析为字段名并填充到创建表单中，在提交前您可根据需要调整描述',
             })
             dialog.show(async (file) => {
-              const buffer = FrontendFileReader.loadFileBuffer(file)
-              await TypicalExcel.excelFromBuffer(buffer as any)
+              const buffer = await FrontendFileReader.loadFileBuffer(file)
+              await TypicalExcel.excelFromBuffer(buffer)
                 .then((excel) => {
                   const dialog = TableInfoDialog.dialogForCreating({
                     name: file.name.split('.')[0],
